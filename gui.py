@@ -614,7 +614,25 @@ class MainWindow(QtWidgets.QMainWindow):
         event.accept()
 
 
+def _set_dpi_awareness() -> None:
+    """Windows 디스플레이 배율(DPI scaling)이 100%가 아닐 때, mss 가 캡처하는
+    물리 픽셀 좌표와 Qt 의 화면 좌표가 어긋나는 것을 방지한다."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main() -> None:
+    _set_dpi_awareness()
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_DisableHighDpiScaling, True)
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow()
     window.show()
