@@ -135,7 +135,11 @@ def render_overlay_cv2(
             heat_alpha = cfg.overlay.heatmap_max_alpha
             cv2.addWeighted(heat_overlay, heat_alpha, out, 1 - heat_alpha, 0, out)
 
-    for rec in solve_result.recommendations:
+    recommendations = solve_result.recommendations
+    if cfg.overlay.highlight_rank:
+        recommendations = [r for r in recommendations if r.rank == cfg.overlay.highlight_rank]
+
+    for rec in recommendations:
         color = RANK_COLORS_BGR.get(rec.rank, (200, 200, 200))
         cells = pieces[rec.piece_index] if rec.piece_index < len(pieces) else tuple()
         rects = placement_cell_rects(board_rect, rec.anchor_row, rec.anchor_col, cells)
@@ -281,7 +285,11 @@ try:
                             painter.setBrush(QtGui.QBrush(fill))
                             painter.drawRect(x, y, w, h)
 
-            for rec in self._solve_result.recommendations:
+            recommendations = self._solve_result.recommendations
+            if cfg.overlay.highlight_rank:
+                recommendations = [r for r in recommendations if r.rank == cfg.overlay.highlight_rank]
+
+            for rec in recommendations:
                 rgb = color_map.get(rec.rank, (200, 200, 200))
                 qcolor = QtGui.QColor(*rgb)
                 cells = self._pieces[rec.piece_index] if rec.piece_index < len(self._pieces) else tuple()

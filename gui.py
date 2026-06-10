@@ -287,6 +287,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_load,
         ):
             toolbar.addWidget(btn)
+
+        toolbar.addWidget(QtWidgets.QLabel("Show:"))
+        self.combo_highlight = QtWidgets.QComboBox()
+        self.combo_highlight.addItem("All", 0)
+        for rank in range(1, self.config.solver.top_k + 1):
+            self.combo_highlight.addItem(str(rank), rank)
+        toolbar.addWidget(self.combo_highlight)
+
         left_layout.addLayout(toolbar)
 
         self.btn_start.clicked.connect(self.on_start)
@@ -296,6 +304,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_debug.toggled.connect(self.on_debug_toggled)
         self.btn_save.clicked.connect(self.on_save)
         self.btn_load.clicked.connect(self.on_load)
+        self.combo_highlight.currentIndexChanged.connect(self.on_highlight_changed)
 
         # 캡처 영역 설정
         region_group = QtWidgets.QGroupBox("Capture Region")
@@ -470,6 +479,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_debug_toggled(self, checked: bool) -> None:
         self._debug_mode = checked
+
+    def on_highlight_changed(self, index: int) -> None:
+        rank = self.combo_highlight.itemData(index)
+        self.config.overlay.highlight_rank = int(rank)
+        if self._last_result is not None and self.overlay_window is not None:
+            self.overlay_window.update_recommendation(
+                self._last_result.solve_result, self._last_result.pieces
+            )
+        self._log(f"Overlay highlight set to: {'All' if rank == 0 else rank}")
 
     def on_save(self) -> None:
         self.config.save()

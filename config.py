@@ -152,6 +152,9 @@ class OverlayConfig:
     heatmap_piece_index: int = 0
     heatmap_max_alpha: float = 0.5
 
+    # 특정 순위(①②③)만 오버레이에 표시 (0 = 전체 표시)
+    highlight_rank: int = 0
+
 
 @dataclass
 class GUIConfig:
