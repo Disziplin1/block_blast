@@ -157,11 +157,13 @@ class PipelineWorker(QtCore.QThread):
 
     def run(self) -> None:  # noqa: D401 - QThread entrypoint
         timer = StageTimer("pipeline")
+        min_interval = max(0.0, self.config.gui.update_interval_ms / 1000.0)
         while self._running:
             if self._paused:
                 time.sleep(0.05)
                 continue
 
+            loop_start = time.perf_counter()
             timer.begin_frame()
             try:
                 with timer.stage("Frame"):
@@ -202,6 +204,12 @@ class PipelineWorker(QtCore.QThread):
                 logger.exception("Pipeline error: %s", exc)
                 self.error_occurred.emit(str(exc))
                 time.sleep(0.2)
+                continue
+
+            elapsed = time.perf_counter() - loop_start
+            sleep_time = min_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
 
 # ---------------------------------------------------------------------------
