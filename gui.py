@@ -237,6 +237,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_result: Optional[PipelineResult] = None
 
         self._build_ui()
+        self._fit_to_screen()
+
+    # ------------------------------------------------------------------
+    def _fit_to_screen(self) -> None:
+        """창이 화면 해상도보다 크게 시작해 화면 밖으로 나가는 것을 방지하고,
+        세로 크기 조절이 가능하도록 화면 가용 영역에 맞춰 크기/위치를 조정한다."""
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        w = min(self.width(), avail.width())
+        h = min(self.height(), avail.height())
+        self.resize(w, h)
+        x = avail.x() + max(0, (avail.width() - w) // 2)
+        y = avail.y() + max(0, (avail.height() - h) // 2)
+        self.move(x, y)
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -317,7 +333,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 디버그 미리보기
         self.preview_label = QtWidgets.QLabel("Debug preview (toggle 'Debug' and 'Start')")
-        self.preview_label.setMinimumSize(480, 480)
+        self.preview_label.setMinimumSize(320, 240)
         self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
         self.preview_label.setStyleSheet("background-color: #222; color: #aaa;")
         left_layout.addWidget(self.preview_label, stretch=1)
@@ -405,7 +421,13 @@ class MainWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(debug_group)
 
         right_layout.addStretch(1)
-        main_layout.addWidget(right_widget, stretch=1)
+
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setWidget(right_widget)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        right_scroll.setMaximumWidth(self.config.gui.panel_width + 24)
+        main_layout.addWidget(right_scroll, stretch=1)
 
     # ------------------------------------------------------------------
     # 버튼 핸들러
