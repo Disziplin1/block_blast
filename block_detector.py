@@ -277,29 +277,49 @@ class BlockDetector:
         """
         search_rect (보통 보드 아래쪽 영역) 안에서 채도가 높은 덩어리(blob)를
         최대 3개 찾아 슬롯 영역으로 추정한다. 좌->우 순서로 정렬하여 반환한다.
+
+        블록 트레이는 3개의 블록이 화면 가장자리에 가깝게 배치되는 경우가
+        많아 _foreground_mask 의 가장자리 기반 배경 추정이 틀어지면서
+        blob 이 하나도 검출되지 않을 수 있다. 이 경우 (0,0,0,0) 으로
+        채워서 인식 자체를 포기하는 대신, search_rect 를 slot_count 개의
+        동일한 너비 컬럼으로 나눈 영역을 슬롯으로 사용해 최소한 Grid
+        Generation/Template Matching 이 시도라도 할 수 있게 한다.
         """
+        slot_count = self.config.tray.slot_count
         x, y, w, h = search_rect
         x = max(0, x)
         y = max(0, y)
         w = min(w, frame.shape[1] - x)
         h = min(h, frame.shape[0] - y)
         if w <= 0 or h <= 0:
-            return []
+            logger.warning("auto_detect_tray_slots: invalid search_rect=%s", search_rect)
+            return [(0, 0, 0, 0)] * slot_count
 
         region = frame[y : y + h, x : x + w]
-        mask, _ = self._foreground_mask(region)
+        mask, threshold = self._foreground_mask(region)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = []
-        for cnt in contours:
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            if bw < 10 or bh < 10:
-                continue
-            boxes.append((bx, by, bw, bh))
+        all_boxes = [cv2.boundingRect(cnt) for cnt in contours]
+        boxes = [b for b in all_boxes if b[2] >= 10 and b[3] >= 10]
 
-        # 면적 기준 상위 3개 선택 후 좌->우 정렬
-        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[: self.config.tray.slot_count]
+        logger.info(
+            "auto_detect_tray_slots: search_rect=(%d,%d,%d,%d) threshold=%.1f "
+            "contours=%d boxes(>=10px)=%s",
+            x, y, w, h, threshold, len(all_boxes), boxes,
+        )
+
+        # 면적 기준 상위 slot_count 개 선택 후 좌->우 정렬
+        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)[:slot_count]
         boxes = sorted(boxes, key=lambda b: b[0])
+
+        if len(boxes) < slot_count:
+            logger.warning(
+                "auto_detect_tray_slots: only %d/%d blob(s) found, "
+                "falling back to %d equal-width columns of search_rect",
+                len(boxes), slot_count, slot_count,
+            )
+            col_w = w // slot_count
+            return [(x + i * col_w, y, col_w, h) for i in range(slot_count)]
 
         slots = []
         for bx, by, bw, bh in boxes:
@@ -314,10 +334,6 @@ class BlockDetector:
                     bh + pad_y * 2,
                 )
             )
-
-        # 슬롯 수가 부족하면 빈 영역으로 채움
-        while len(slots) < self.config.tray.slot_count:
-            slots.append((0, 0, 0, 0))
 
         return slots
 
