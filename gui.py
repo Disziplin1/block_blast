@@ -570,6 +570,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
         left_layout.addWidget(region_group)
 
+        # 트레이 Grid 생성용 고정 Cell Pitch (px). 3x3 이 2x2 로, 5칸 블록이
+        # 4칸으로 인식되는 등 grid_cols/grid_rows 가 실제 모양과 다르게
+        # 계산될 때, 이 값을 직접 조절해 Block ROI(Debug) 패널의 bbox/grid
+        # 표시를 보면서 실제 화면에 맞게 보정한다.
+        pitch_group = QtWidgets.QGroupBox("Tray Cell Pitch (px)")
+        pitch_layout = QtWidgets.QHBoxLayout(pitch_group)
+        self.spin_cell_pitch = QtWidgets.QDoubleSpinBox()
+        self.spin_cell_pitch.setRange(1.0, 300.0)
+        self.spin_cell_pitch.setSingleStep(0.5)
+        self.spin_cell_pitch.setDecimals(1)
+        self.spin_cell_pitch.setValue(self.config.tray.cell_pitch)
+        pitch_layout.addWidget(QtWidgets.QLabel("Pitch"))
+        pitch_layout.addWidget(self.spin_cell_pitch)
+        pitch_layout.addWidget(QtWidgets.QLabel(
+            "값을 줄이면 grid_cols/rows 가 커지고, 늘리면 작아집니다 "
+            "(Block ROI 의 bbox/grid 표시를 보며 조절)"
+        ))
+        pitch_layout.addStretch(1)
+        self.spin_cell_pitch.valueChanged.connect(self.on_cell_pitch_changed)
+        left_layout.addWidget(pitch_group)
+
         # 디버그 미리보기
         self.preview_label = QtWidgets.QLabel("Debug preview (toggle 'Debug' and 'Start')")
         self.preview_label.setMinimumSize(320, 240)
@@ -734,6 +755,9 @@ class MainWindow(QtWidgets.QMainWindow):
             cell_w = w / self.config.board.cols
             cell_h = h / self.config.board.rows
             self.config.tray.cell_pitch = ((cell_w + cell_h) / 2.0) * self.config.tray.piece_cell_scale
+            self.spin_cell_pitch.blockSignals(True)
+            self.spin_cell_pitch.setValue(self.config.tray.cell_pitch)
+            self.spin_cell_pitch.blockSignals(False)
 
             self._log(
                 f"Calibration done. board_rect={self.config.board.board_rect}, "
@@ -741,6 +765,13 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         else:
             self._log("Calibration failed: could not detect board")
+
+    def on_cell_pitch_changed(self, value: float) -> None:
+        """Tray Cell Pitch 를 직접 조절한다 (3x3->2x2, 5칸->4칸 등 grid_cols/rows
+        오인식 보정용). Block ROI(Debug) 패널의 bbox/grid 표시를 보며 실제
+        화면의 블록 1칸 크기에 맞을 때까지 값을 조절하면 된다."""
+        self.config.tray.cell_pitch = value
+        self._log(f"Tray cell_pitch set to {value:.1f}")
 
     def on_debug_toggled(self, checked: bool) -> None:
         self._debug_mode = checked
@@ -771,6 +802,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_y.setValue(y)
         self.spin_w.setValue(w)
         self.spin_h.setValue(h)
+        self.spin_cell_pitch.blockSignals(True)
+        self.spin_cell_pitch.setValue(self.config.tray.cell_pitch)
+        self.spin_cell_pitch.blockSignals(False)
         self._log("Config loaded")
 
     def on_apply_region(self) -> None:
@@ -959,15 +993,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # ROI -> Grid 생성(Grid Overlay 는 위 이미지에 표시) -> Occupancy
             # Matrix -> Template Input Matrix -> Selected -> Similarity 를
-            # 모두 함께 표시한다.
+            # 모두 함께 표시한다. bbox/grid/pitch 는 3x3->2x2 같은 grid_cols/
+            # rows 오인식을 Tray Cell Pitch 조절로 보정할 때 참고용.
             if det is not None and not det.empty:
                 occupancy_text = _format_grid_blocks(det.debug_grid)
                 template_input_text = _format_grid_matrix(det.template_input)
+                bw, bh = det.bbox[2], det.bbox[3]
+                grid_rows, grid_cols = det.debug_grid.shape
+                grid_text = f"bbox={bw}x{bh} grid={grid_rows}x{grid_cols} pitch={det.cell_pitch_used:.1f}"
             else:
                 occupancy_text = "(empty)"
                 template_input_text = "[]"
+                grid_text = "-"
 
             self.roi_info_labels[i].setText(
+                f"{grid_text}\n"
                 f"Occupancy:\n{occupancy_text}\n"
                 f"Template Input:\n{template_input_text}\n"
                 f"Selected: {template_name}\n"

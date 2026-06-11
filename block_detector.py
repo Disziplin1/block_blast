@@ -54,6 +54,7 @@ class DetectedPiece:
     template_similarity: float = 0.0  # 선택된 템플릿과의 Jaccard 유사도 (0~1)
     # debug_grid 를 좌상단 기준으로 trim 한 결과 (Template Matching 의 입력 행렬)
     template_input: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.int8))
+    cell_pitch_used: float = 0.0  # 이 슬롯의 Grid Generation 에 사용된 고정 Cell Pitch(px)
 
 
 class BlockDetector:
@@ -228,7 +229,7 @@ class BlockDetector:
             return DetectedPiece(
                 grid=np.zeros((1, 1), dtype=np.int8), cells=tuple(), bbox=(0, 0, 0, 0), empty=True,
                 debug_grid=debug_grid, debug_cells=debug_cells, threshold_used=threshold_used,
-                template_input=trimmed,
+                template_input=trimmed, cell_pitch_used=pitch,
             )
 
         # Bounding Box 기반 추정 대신, occupancy grid 를 표준 Shape Template 들과
@@ -238,7 +239,7 @@ class BlockDetector:
             grid=template.grid, cells=template.cells, bbox=(bx, by, bw, bh), empty=False,
             debug_grid=debug_grid, debug_cells=debug_cells, threshold_used=threshold_used,
             template_name=template.name, template_similarity=similarity,
-            template_input=trimmed,
+            template_input=trimmed, cell_pitch_used=pitch,
         )
 
     # ------------------------------------------------------------------
