@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from typing import List, Optional
 
 import cv2
@@ -143,6 +143,8 @@ class PipelineResult:
         roi_images: Optional[List[np.ndarray]] = None,
         block_stable: Optional[List[bool]] = None,
         block_confidence: Optional[List[float]] = None,
+        template_names: Optional[List[str]] = None,
+        template_similarities: Optional[List[float]] = None,
     ):
         self.frame = frame
         self.board = board
@@ -159,6 +161,8 @@ class PipelineResult:
         self.roi_images = roi_images or []
         self.block_stable = block_stable or []
         self.block_confidence = block_confidence or []
+        self.template_names = template_names or []
+        self.template_similarities = template_similarities or []
 
 
 class PipelineWorker(QtCore.QThread):
@@ -194,11 +198,14 @@ class PipelineWorker(QtCore.QThread):
         self._board_hash_history: deque = deque(maxlen=30)
         self._blocks_hash_history: deque = deque(maxlen=30)
 
-        # 블록별 Shape 안정성 추적 (#5)
+        # 블록별 Shape 안정성 추적: 최근 10프레임 Majority Vote + 5프레임 이상
+        # 동일 Majority 가 유지되면 Stable Shape 로 확정한다. Solver 에는
+        # Stable Shape(없으면 현재 Majority Shape)만 전달한다.
         slot_count = self.config.tray.slot_count
-        self._block_hash_history: List[deque] = [deque(maxlen=30) for _ in range(slot_count)]
-        self._block_prev_hash: List[Optional[str]] = [None] * slot_count
-        self._block_consecutive: List[int] = [0] * slot_count
+        self._block_shape_history: List[deque] = [deque(maxlen=10) for _ in range(slot_count)]
+        self._block_prev_majority: List[Optional[PieceCells]] = [None] * slot_count
+        self._block_majority_consecutive: List[int] = [0] * slot_count
+        self._block_stable_shape: List[Optional[PieceCells]] = [None] * slot_count
 
         self._debug_mode = False
 
@@ -240,32 +247,50 @@ class PipelineWorker(QtCore.QThread):
 
                 with timer.stage("Recognize"):
                     detections = self.block_detector.detect(frame)
-                    pieces = [d.cells for d in detections]
 
-                # 보드/블록 해시 계산 (#3, #7)
+                # 블록별 Shape 안정화: 최근 10프레임 Majority Vote 를 적용해
+                # 프레임마다 Shape 가 흔들려도(L L L T L L L) 최종 Shape 는
+                # 다수결(L)로 고정한다. Majority Shape 가 5프레임 이상 연속
+                # 유지되면 Stable Shape 로 확정하고, Solver 에는 Stable Shape
+                # (없으면 현재 Majority Shape)만 전달한다.
+                pieces: List[PieceCells] = []
+                block_stable: List[bool] = []
+                block_confidence: List[float] = []
+                template_names: List[str] = []
+                template_similarities: List[float] = []
+                for i, det in enumerate(detections):
+                    hist = self._block_shape_history[i]
+                    hist.append(det.cells)
+                    majority_shape, majority_count = Counter(hist).most_common(1)[0]
+
+                    if majority_shape == self._block_prev_majority[i]:
+                        self._block_majority_consecutive[i] += 1
+                    else:
+                        self._block_majority_consecutive[i] = 1
+                        self._block_prev_majority[i] = majority_shape
+
+                    is_stable = self._block_majority_consecutive[i] >= 5
+                    if is_stable:
+                        self._block_stable_shape[i] = majority_shape
+
+                    chosen = (
+                        self._block_stable_shape[i]
+                        if self._block_stable_shape[i] is not None
+                        else majority_shape
+                    )
+                    pieces.append(chosen)
+                    block_stable.append(is_stable)
+                    block_confidence.append(majority_count / len(hist) * 100.0)
+                    template_names.append(det.template_name)
+                    template_similarities.append(det.template_similarity)
+
+                # 보드/블록 해시 계산 (Solver 에 전달되는 Stable Shape 기준) (#3, #7)
                 board_hash = hashlib.md5(board.tobytes()).hexdigest()[:8]
                 blocks_hash = hashlib.md5(str(pieces).encode("utf-8")).hexdigest()[:8]
                 self._board_hash_history.append(board_hash)
                 self._blocks_hash_history.append(blocks_hash)
                 board_stable_pct = _stability_pct(self._board_hash_history)
                 blocks_stable_pct = _stability_pct(self._blocks_hash_history)
-
-                # 블록별 Shape 안정성: 5프레임 이상 동일하면 Stable, Confidence 는
-                # 최근 30프레임 중 현재 Shape 와 같은 비율 (#5)
-                block_stable: List[bool] = []
-                block_confidence: List[float] = []
-                for i, det in enumerate(detections):
-                    block_hash = hashlib.md5(str(det.grid.tolist()).encode("utf-8")).hexdigest()[:8]
-                    hist = self._block_hash_history[i]
-                    hist.append(block_hash)
-                    if self._block_prev_hash[i] == block_hash:
-                        self._block_consecutive[i] += 1
-                    else:
-                        self._block_consecutive[i] = 1
-                    self._block_prev_hash[i] = block_hash
-                    block_stable.append(self._block_consecutive[i] >= 5)
-                    same = sum(1 for h in hist if h == block_hash)
-                    block_confidence.append(same / len(hist) * 100.0)
 
                 # 화면이 이전 프레임과 동일하면 Solver 를 다시 실행하지 않는다 (#2)
                 board_unchanged = (
@@ -312,8 +337,8 @@ class PipelineWorker(QtCore.QThread):
                 if self._debug_mode:
                     for i, det in enumerate(detections, start=1):
                         logger.info(
-                            "Block%d Cells (threshold=%.1f, stable=%s, confidence=%.0f%%):\n%s",
-                            i, det.threshold_used,
+                            "Block%d Cells (threshold=%.1f, template=%s sim=%.2f, stable=%s, confidence=%.0f%%):\n%s",
+                            i, det.threshold_used, det.template_name, det.template_similarity,
                             block_stable[i - 1] if i - 1 < len(block_stable) else False,
                             block_confidence[i - 1] if i - 1 < len(block_confidence) else 0.0,
                             _format_cell_debug(det),
@@ -336,6 +361,8 @@ class PipelineWorker(QtCore.QThread):
                     roi_images=roi_images,
                     block_stable=block_stable,
                     block_confidence=block_confidence,
+                    template_names=template_names,
+                    template_similarities=template_similarities,
                 )
                 self.result_ready.emit(result)
 
@@ -774,6 +801,11 @@ class MainWindow(QtWidgets.QMainWindow):
         lines.append(f"Board Hash: {result.board_hash}")
         for i, shape in enumerate(result.block_shapes, start=1):
             lines.append(f"Block{i}: {shape}")
+            if i - 1 < len(result.template_names):
+                lines.append(
+                    f"  Template: {result.template_names[i - 1]} "
+                    f"(sim={result.template_similarities[i - 1]:.2f})"
+                )
             if i - 1 < len(result.block_stable):
                 stable = "Stable" if result.block_stable[i - 1] else "Unstable"
                 conf = result.block_confidence[i - 1]
@@ -845,8 +877,11 @@ class MainWindow(QtWidgets.QMainWindow):
             conf = result.block_confidence[i] if i < len(result.block_confidence) else 0.0
             det = result.detections[i] if i < len(result.detections) else None
             threshold = det.threshold_used if det is not None else 0.0
+            template_name = result.template_names[i] if i < len(result.template_names) else "-"
+            similarity = result.template_similarities[i] if i < len(result.template_similarities) else 0.0
             self.roi_info_labels[i].setText(
-                f"Shape: {shape}\n"
+                f"Template: {template_name} ({similarity:.2f})\n"
+                f"Solver Shape: {shape}\n"
                 f"{'Stable' if stable else 'Unstable'} (Conf: {conf:.0f}%)\n"
                 f"Threshold: {threshold:.1f}"
             )
