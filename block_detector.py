@@ -10,9 +10,10 @@ block_detector.py
 2. ROI 가장자리(배경)의 채도 분포(median/MAD)로 Adaptive Threshold 를 계산하고,
    HSV 채도(saturation) 기준으로 배경과 블록 픽셀을 구분하는 마스크를 만든다.
 3. 마스크의 바운딩 박스를 구해 블록이 존재하는지(빈 슬롯 여부) 판단한다.
-4. (Grid Detection) 보드 셀 크기 x tray.piece_cell_scale 로 추정한 셀 픽셀
-   크기를 이용해 바운딩 박스를 NxM 그리드로 나누고, 각 서브셀의 안쪽(margin)
-   영역의 마스크 비율/평균 색상으로 0/1 (Occupied) 을 결정한다.
+4. (Grid Detection) bbox 크기에 맞춰 셀 크기를 매 프레임 추정하지 않고,
+   config.tray.cell_pitch 에 저장된 고정 Cell Pitch(px) 를 셀 한 칸의
+   픽셀 크기로 사용해 바운딩 박스를 NxM 그리드로 나누고, 각 서브셀의
+   안쪽(margin) 영역의 마스크 비율/평균 색상으로 0/1 (Occupied) 을 결정한다.
 5. (Template Matching) 위에서 얻은 occupancy grid 를 shape_templates 에
    미리 정의된 모든 블록 모양과 비교(Jaccard 유사도)하여 가장 유사한
    템플릿을 선택하고, 그 템플릿의 Shape Matrix 를 Solver 입력으로 사용한다.
@@ -51,6 +52,8 @@ class DetectedPiece:
     threshold_used: float = 0.0  # 이 슬롯에 사용된 Adaptive Saturation Threshold
     template_name: str = ""      # Template Matching 에서 선택된 템플릿 이름
     template_similarity: float = 0.0  # 선택된 템플릿과의 Jaccard 유사도 (0~1)
+    # debug_grid 를 좌상단 기준으로 trim 한 결과 (Template Matching 의 입력 행렬)
+    template_input: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.int8))
 
 
 class BlockDetector:
@@ -64,6 +67,25 @@ class BlockDetector:
             # 캘리브레이션 전: 적당한 기본값
             return 40.0, 40.0
         return w / COLS, h / ROWS
+
+    # ------------------------------------------------------------------
+    def _piece_cell_pitch(self) -> float:
+        """트레이 Grid 생성에 사용할 고정 Cell Pitch(px)를 반환한다.
+
+        bbox 크기에서 매 프레임 셀 크기(sub_w/sub_h)를 다시 추정(자동 추정)하면,
+        bbox 검출 노이즈에 따라 grid_cols/grid_rows 와 셀 경계가 흔들려
+        Occupancy Matrix 가 실제 블록 모양과 달라지는 문제가 있었다.
+        이를 막기 위해 config.tray.cell_pitch 에 저장된 고정 값을 그대로
+        셀 한 칸의 픽셀 크기로 사용한다 (Calibration 시 1회 계산되어 저장됨).
+
+        아직 캘리브레이션되지 않아 cell_pitch 가 0 이하이면, 보드 1칸 크기 *
+        piece_cell_scale 로 1회 추정한 값을 fallback 으로 사용한다.
+        """
+        pitch = self.config.tray.cell_pitch
+        if pitch > 0:
+            return pitch
+        cell_w, cell_h = self._board_cell_size()
+        return max(1.0, ((cell_w + cell_h) / 2.0) * self.config.tray.piece_cell_scale)
 
     # ------------------------------------------------------------------
     def _adaptive_threshold(self, sat: np.ndarray) -> float:
@@ -151,18 +173,15 @@ class BlockDetector:
                 threshold_used=threshold_used,
             )
 
-        cell_w, cell_h = self._board_cell_size()
-        piece_cell_w = max(1.0, cell_w * self.config.tray.piece_cell_scale)
-        piece_cell_h = max(1.0, cell_h * self.config.tray.piece_cell_scale)
+        # Cell Size 자동 추정(bbox / grid_cols) 대신, 고정 Cell Pitch(px) 를
+        # 그대로 셀 크기로 사용한다. bbox 크기에 맞춰 셀을 늘리면 bbox 검출
+        # 노이즈에 따라 grid_cols/grid_rows 와 셀 경계가 매 프레임 흔들려
+        # Occupancy Matrix 가 실제 모양과 달라지는 문제가 있었다.
+        pitch = self._piece_cell_pitch()
 
         max_size = self.config.tray.max_piece_size
-        grid_cols = int(round(bw / piece_cell_w))
-        grid_rows = int(round(bh / piece_cell_h))
-        grid_cols = max(1, min(max_size, grid_cols))
-        grid_rows = max(1, min(max_size, grid_rows))
-
-        sub_w = bw / grid_cols
-        sub_h = bh / grid_rows
+        grid_cols = max(1, min(max_size, int(round(bw / pitch))))
+        grid_rows = max(1, min(max_size, int(round(bh / pitch))))
 
         debug_grid = np.zeros((grid_rows, grid_cols), dtype=np.int8)
         debug_cells: List[Tuple[int, int, Tuple[int, int, int], bool]] = []
@@ -177,10 +196,10 @@ class BlockDetector:
         fill_ratio_threshold = 0.35
         for r in range(grid_rows):
             for c in range(grid_cols):
-                sx0 = int(c * sub_w)
-                sy0 = int(r * sub_h)
-                sx1 = int((c + 1) * sub_w)
-                sy1 = int((r + 1) * sub_h)
+                sx0 = min(int(c * pitch), bw)
+                sy0 = min(int(r * pitch), bh)
+                sx1 = min(int((c + 1) * pitch), bw)
+                sy1 = min(int((r + 1) * pitch), bh)
 
                 mx = int((sx1 - sx0) * margin_ratio)
                 my = int((sy1 - sy0) * margin_ratio)
@@ -209,6 +228,7 @@ class BlockDetector:
             return DetectedPiece(
                 grid=np.zeros((1, 1), dtype=np.int8), cells=tuple(), bbox=(0, 0, 0, 0), empty=True,
                 debug_grid=debug_grid, debug_cells=debug_cells, threshold_used=threshold_used,
+                template_input=trimmed,
             )
 
         # Bounding Box 기반 추정 대신, occupancy grid 를 표준 Shape Template 들과
@@ -218,6 +238,7 @@ class BlockDetector:
             grid=template.grid, cells=template.cells, bbox=(bx, by, bw, bh), empty=False,
             debug_grid=debug_grid, debug_cells=debug_cells, threshold_used=threshold_used,
             template_name=template.name, template_similarity=similarity,
+            template_input=trimmed,
         )
 
     # ------------------------------------------------------------------

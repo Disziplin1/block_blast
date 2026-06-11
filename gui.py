@@ -63,6 +63,45 @@ def _format_cell_debug(det: DetectedPiece) -> str:
     return "\n".join(f"  Cell({r},{c})=RGB{rgb}={occ}" for r, c, rgb, occ in det.debug_cells)
 
 
+def _format_grid_blocks(grid: np.ndarray) -> str:
+    """0/1 격자를 ■(채움)/□(빈칸) 문자로 표현한 멀티라인 문자열로 변환한다."""
+    if grid.size == 0:
+        return "(empty)"
+    return "\n".join("".join("■" if v else "□" for v in row) for row in grid.tolist())
+
+
+def _format_grid_matrix(grid: np.ndarray) -> str:
+    """0/1 격자를 [[1,1],\n [1,0]] 형태의 문자열로 변환한다."""
+    if grid.size == 0:
+        return "[]"
+    rows = [str(row) for row in grid.tolist()]
+    return "[" + ",\n ".join(rows) + "]"
+
+
+def _format_pipeline_debug(index: int, det: DetectedPiece) -> str:
+    """블록 1개의 ROI -> Grid 생성 -> Occupancy 판정 -> Template Matching
+    파이프라인 단계별 결과를 콘솔/디버그 패널 출력용 문자열로 변환한다."""
+    header = f"--- Block{index} ---"
+    if det.empty:
+        return f"{header}\n(empty slot)"
+    return "\n".join(
+        [
+            header,
+            "[ROI/Grid]",
+            _format_grid_blocks(det.debug_grid),
+            "",
+            "[Occupancy Matrix]",
+            _format_grid_matrix(det.debug_grid),
+            "",
+            "[Template Input]",
+            _format_grid_matrix(det.template_input),
+            "",
+            f"[Selected] {det.template_name}",
+            f"[Similarity] {det.template_similarity:.2f}",
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # 화면 영역 드래그 선택용 투명 위젯
 # ---------------------------------------------------------------------------
@@ -365,6 +404,9 @@ class PipelineWorker(QtCore.QThread):
                             block_confidence[i - 1] if i - 1 < len(block_confidence) else 0.0,
                             _format_cell_debug(det),
                         )
+                        # ROI -> Grid 생성 -> Occupancy -> Template Input -> Selected
+                        # -> Similarity 파이프라인 단계별 결과를 모두 출력한다.
+                        logger.info("\n%s", _format_pipeline_debug(i, det))
                         roi_images.append(self.block_detector.render_roi_debug(frame, self.config.tray.slot_rects[i - 1], det))
 
                 result = PipelineResult(
@@ -624,6 +666,7 @@ class MainWindow(QtWidgets.QMainWindow):
             col.addWidget(img_label)
             info_label = QtWidgets.QLabel("-")
             info_label.setWordWrap(True)
+            info_label.setFont(QtGui.QFont("Monospace"))
             col.addWidget(info_label)
             self.roi_labels.append(img_label)
             self.roi_info_labels.append(info_label)
@@ -683,7 +726,19 @@ class MainWindow(QtWidgets.QMainWindow):
             search_rect = (x, search_y, w, search_h)
             slots = self.block_detector.auto_detect_tray_slots(frame, search_rect)
             self.config.tray.slot_rects = slots
-            self._log(f"Calibration done. board_rect={self.config.board.board_rect}, slots={slots}")
+
+            # Cell Size 자동 추정 대신, 캘리브레이션 시점의 보드 1칸 크기를
+            # 기준으로 트레이 Grid 의 고정 Cell Pitch(px)를 1회 계산해 둔다.
+            # 이후 detect_slot() 은 매 프레임 bbox 크기로 셀 크기를 다시
+            # 추정하지 않고 이 고정값을 그대로 사용한다.
+            cell_w = w / self.config.board.cols
+            cell_h = h / self.config.board.rows
+            self.config.tray.cell_pitch = ((cell_w + cell_h) / 2.0) * self.config.tray.piece_cell_scale
+
+            self._log(
+                f"Calibration done. board_rect={self.config.board.board_rect}, "
+                f"slots={slots}, cell_pitch={self.config.tray.cell_pitch:.1f}"
+            )
         else:
             self._log("Calibration failed: could not detect board")
 
@@ -901,8 +956,22 @@ class MainWindow(QtWidgets.QMainWindow):
             threshold = det.threshold_used if det is not None else 0.0
             template_name = result.template_names[i] if i < len(result.template_names) else "-"
             similarity = result.template_similarities[i] if i < len(result.template_similarities) else 0.0
+
+            # ROI -> Grid 생성(Grid Overlay 는 위 이미지에 표시) -> Occupancy
+            # Matrix -> Template Input Matrix -> Selected -> Similarity 를
+            # 모두 함께 표시한다.
+            if det is not None and not det.empty:
+                occupancy_text = _format_grid_blocks(det.debug_grid)
+                template_input_text = _format_grid_matrix(det.template_input)
+            else:
+                occupancy_text = "(empty)"
+                template_input_text = "[]"
+
             self.roi_info_labels[i].setText(
-                f"Template: {template_name} ({similarity:.2f})\n"
+                f"Occupancy:\n{occupancy_text}\n"
+                f"Template Input:\n{template_input_text}\n"
+                f"Selected: {template_name}\n"
+                f"Similarity: {similarity:.2f}\n"
                 f"Solver Shape: {shape}\n"
                 f"{'Stable' if stable else 'Unstable'} (Conf: {conf:.0f}%)\n"
                 f"Threshold: {threshold:.1f}"

@@ -53,7 +53,13 @@ class TrayConfig:
     )
     max_piece_size: int = 5  # 블록의 최대 가로/세로 셀 수
     # 트레이에 표시되는 블록 1칸의 픽셀 크기 = 보드 1칸 크기 * piece_cell_scale
+    # (cell_pitch 가 설정되지 않았을 때의 1회성 추정에만 사용된다)
     piece_cell_scale: float = 0.6
+    # 트레이 Grid 생성에 사용하는 고정 Cell Pitch(px). bbox 크기에서 매 프레임
+    # 셀 크기를 다시 추정하지 않고, 이 값을 그대로 셀 한 칸의 픽셀 크기로 사용한다.
+    # 0 이하이면 캘리브레이션 전 1회성 기본값(보드 1칸 크기 * piece_cell_scale)을 사용한다.
+    # Calibration 시 보드 1칸 크기를 기준으로 자동 계산되어 저장된다.
+    cell_pitch: float = 0.0
     # 트레이 배경과 블록을 구분하는 채도(saturation) 임계값
     empty_saturation_threshold: float = 35.0
 
