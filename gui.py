@@ -14,15 +14,17 @@ PyQt5 기반 메인 GUI.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import time
+from collections import deque
 from typing import List, Optional
 
 import cv2
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from block_detector import BlockDetector
+from block_detector import BlockDetector, DetectedPiece
 from board_detector import BoardDetector
 from capture import ScreenCapture
 from config import AppConfig, CONFIG
@@ -31,9 +33,27 @@ from logger import StageTimer, get_logger
 from overlay import OverlayWindow, PYQT_AVAILABLE, render_overlay_cv2
 from heuristic import evaluate_with_breakdown
 from solver import SolveResult, _normalize_pieces, solve
-from utils import PieceCells
+from utils import PieceCells, piece_cells_to_grid
 
 logger = get_logger("gui")
+
+
+# ---------------------------------------------------------------------------
+# Vision 디버깅 헬퍼 (#3, #7)
+# ---------------------------------------------------------------------------
+def _piece_shape_str(cells: PieceCells) -> str:
+    """PieceCells 를 콘솔 출력용 Shape Matrix 문자열로 변환한다."""
+    if not cells:
+        return "(empty)"
+    return str(piece_cells_to_grid(cells).tolist())
+
+
+def _stability_pct(history: "deque") -> float:
+    """최근 프레임 히스토리에서 직전 프레임과 값이 같았던 비율(%)을 계산한다."""
+    if len(history) < 2:
+        return 100.0
+    same = sum(1 for i in range(1, len(history)) if history[i] == history[i - 1])
+    return (same / (len(history) - 1)) * 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +127,12 @@ class PipelineResult:
         solve_result: SolveResult,
         timings: dict,
         fps: float,
+        detections: Optional[List[DetectedPiece]] = None,
+        board_hash: str = "",
+        block_shapes: Optional[List[str]] = None,
+        search_executed: bool = True,
+        board_stable_pct: float = 100.0,
+        blocks_stable_pct: float = 100.0,
     ):
         self.frame = frame
         self.board = board
@@ -114,6 +140,12 @@ class PipelineResult:
         self.solve_result = solve_result
         self.timings = timings
         self.fps = fps
+        self.detections = detections or []
+        self.board_hash = board_hash
+        self.block_shapes = block_shapes or []
+        self.search_executed = search_executed
+        self.board_stable_pct = board_stable_pct
+        self.blocks_stable_pct = blocks_stable_pct
 
 
 class PipelineWorker(QtCore.QThread):
@@ -141,6 +173,13 @@ class PipelineWorker(QtCore.QThread):
         self._data_logger: Optional[DataLogger] = None
         if self.config.logging.data_logging_enabled:
             self._data_logger = DataLogger(self.config)
+
+        # Vision 안정성 디버깅용 상태 (#2, #3, #7)
+        self._prev_board: Optional[np.ndarray] = None
+        self._prev_pieces: Optional[List[PieceCells]] = None
+        self._prev_solve_result: Optional[SolveResult] = None
+        self._board_hash_history: deque = deque(maxlen=30)
+        self._blocks_hash_history: deque = deque(maxlen=30)
 
     def start_pipeline(self) -> None:
         self._running = True
@@ -176,10 +215,32 @@ class PipelineWorker(QtCore.QThread):
                     board = self.board_detector.detect(frame)
 
                 with timer.stage("Recognize"):
-                    pieces = self.block_detector.detect_pieces_cells(frame)
+                    detections = self.block_detector.detect(frame)
+                    pieces = [d.cells for d in detections]
 
-                with timer.stage("Search+Evaluate"):
-                    solve_result = solve(board, pieces, self.config)
+                # 보드/블록 해시 계산 (#3, #7)
+                board_hash = hashlib.md5(board.tobytes()).hexdigest()[:8]
+                blocks_hash = hashlib.md5(str(pieces).encode("utf-8")).hexdigest()[:8]
+                self._board_hash_history.append(board_hash)
+                self._blocks_hash_history.append(blocks_hash)
+                board_stable_pct = _stability_pct(self._board_hash_history)
+                blocks_stable_pct = _stability_pct(self._blocks_hash_history)
+
+                # 화면이 이전 프레임과 동일하면 Solver 를 다시 실행하지 않는다 (#2)
+                board_unchanged = (
+                    self._prev_board is not None and np.array_equal(board, self._prev_board)
+                )
+                pieces_unchanged = pieces == self._prev_pieces
+                if board_unchanged and pieces_unchanged and self._prev_solve_result is not None:
+                    solve_result = self._prev_solve_result
+                    search_executed = False
+                else:
+                    with timer.stage("Search+Evaluate"):
+                        solve_result = solve(board, pieces, self.config)
+                    search_executed = True
+                    self._prev_board = board.copy()
+                    self._prev_pieces = pieces
+                    self._prev_solve_result = solve_result
 
                 with timer.stage("Recommend"):
                     pass  # solve_result.recommendations 자체가 추천 결과
@@ -190,6 +251,22 @@ class PipelineWorker(QtCore.QThread):
                     except Exception:  # pragma: no cover - 로깅 실패는 파이프라인을 막지 않음
                         logger.exception("Data logging failed")
 
+                block_shapes = [_piece_shape_str(p) for p in pieces]
+                confidence = solve_result.recommendations[0].confidence if solve_result.recommendations else 0.0
+                logger.info(
+                    "\nBoard Hash:\n%s\nBlock1:\n%s\nBlock2:\n%s\nBlock3:\n%s\n"
+                    "Search Executed:\n%s\nConfidence:\n%.1f%%\n"
+                    "Board Stable: %.0f%% | Blocks Stable: %.0f%%",
+                    board_hash,
+                    block_shapes[0] if len(block_shapes) > 0 else "(empty)",
+                    block_shapes[1] if len(block_shapes) > 1 else "(empty)",
+                    block_shapes[2] if len(block_shapes) > 2 else "(empty)",
+                    "YES" if search_executed else "NO",
+                    confidence,
+                    board_stable_pct,
+                    blocks_stable_pct,
+                )
+
                 result = PipelineResult(
                     frame=frame,
                     board=board,
@@ -197,6 +274,12 @@ class PipelineWorker(QtCore.QThread):
                     solve_result=solve_result,
                     timings=timer.as_dict(),
                     fps=self.capture.fps,
+                    detections=detections,
+                    board_hash=board_hash,
+                    block_shapes=block_shapes,
+                    search_executed=search_executed,
+                    board_stable_pct=board_stable_pct,
+                    blocks_stable_pct=blocks_stable_pct,
                 )
                 self.result_ready.emit(result)
 
@@ -601,6 +684,16 @@ class MainWindow(QtWidgets.QMainWindow):
         sr = result.solve_result
         lines: List[str] = []
 
+        # Vision 안정성 정보 (#3, #7)
+        lines.append("=== Vision Stability ===")
+        lines.append(f"Board Hash: {result.board_hash}")
+        for i, shape in enumerate(result.block_shapes, start=1):
+            lines.append(f"Block{i}: {shape}")
+        lines.append(f"Search Executed: {'YES' if result.search_executed else 'NO'}")
+        lines.append(f"Board Stable: {result.board_stable_pct:.0f}%")
+        lines.append(f"Blocks Stable: {result.blocks_stable_pct:.0f}%")
+        lines.append("")
+
         if sr.recommendations:
             top = sr.recommendations[0]
             seq = top.full_sequence
@@ -629,6 +722,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_preview(self, result: PipelineResult) -> None:
         frame = result.frame
         frame = self.board_detector.draw_debug_overlay(frame, result.board)
+        frame = self.block_detector.draw_debug_overlay(frame, result.detections)
         frame = render_overlay_cv2(frame, result.solve_result, result.pieces, self.config)
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

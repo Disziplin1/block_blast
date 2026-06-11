@@ -52,16 +52,25 @@ class BlockDetector:
 
     # ------------------------------------------------------------------
     def _foreground_mask(self, slot_img: np.ndarray) -> np.ndarray:
-        """슬롯 이미지에서 배경이 아닌(채도가 높은) 픽셀의 이진 마스크를 반환."""
-        hsv = cv2.cvtColor(slot_img, cv2.COLOR_BGR2HSV)
+        """슬롯 이미지에서 배경이 아닌(채도가 높은) 픽셀의 이진 마스크를 반환.
+
+        Threshold 근처의 작은 흔들림(프레임 노이즈)이 셀 판정을 매번
+        뒤집지 않도록, 마스크 생성 전 Median Blur 로 노이즈를 줄이고
+        Morphology Open/Close 를 더 강하게 적용한다.
+        """
+        blurred = slot_img
+        if slot_img.shape[0] >= 5 and slot_img.shape[1] >= 5:
+            blurred = cv2.medianBlur(slot_img, 5)
+
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
         sat = hsv[:, :, 1]
         threshold = self.config.tray.empty_saturation_threshold
         mask = (sat > threshold).astype(np.uint8) * 255
 
-        # 노이즈 제거
+        # 노이즈 제거: Open(작은 점 제거) -> Close(작은 구멍 메움, 2회)
         kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         return mask
 
     # ------------------------------------------------------------------
@@ -103,6 +112,11 @@ class BlockDetector:
         grid = np.zeros((grid_rows, grid_cols), dtype=np.int8)
         bbox_mask = mask[by : by + bh, bx : bx + bw]
 
+        # 서브셀 가장자리는 인접한 채워진 셀의 픽셀이 번져 들어오기 쉬우므로,
+        # 각 서브셀의 안쪽(margin 만큼 줄인) 영역만으로 채움 비율을 계산한다.
+        # 이렇게 하지 않으면 L자/T자 등 빈 칸이 있는 모양이 꽉 찬 사각형으로
+        # 인식되는 문제가 발생한다.
+        margin_ratio = 0.2
         fill_ratio_threshold = 0.35
         for r in range(grid_rows):
             for c in range(grid_cols):
@@ -110,18 +124,41 @@ class BlockDetector:
                 sy0 = int(r * sub_h)
                 sx1 = int((c + 1) * sub_w)
                 sy1 = int((r + 1) * sub_h)
-                sub = bbox_mask[sy0:sy1, sx0:sx1]
-                if sub.size == 0:
+
+                mx = int((sx1 - sx0) * margin_ratio)
+                my = int((sy1 - sy0) * margin_ratio)
+                inner = bbox_mask[sy0 + my : sy1 - my, sx0 + mx : sx1 - mx]
+                if inner.size == 0:
+                    inner = bbox_mask[sy0:sy1, sx0:sx1]
+                if inner.size == 0:
                     continue
-                fill_ratio = np.count_nonzero(sub) / sub.size
+
+                fill_ratio = np.count_nonzero(inner) / inner.size
                 if fill_ratio >= fill_ratio_threshold:
                     grid[r, c] = 1
 
+        grid = self._trim_grid(grid)
         if grid.sum() == 0:
             return DetectedPiece(grid=np.zeros((1, 1), dtype=np.int8), cells=tuple(), bbox=(0, 0, 0, 0), empty=True)
 
         cells = piece_grid_to_cells(grid.tolist())
         return DetectedPiece(grid=grid, cells=cells, bbox=(bx, by, bw, bh), empty=False)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _trim_grid(grid: np.ndarray) -> np.ndarray:
+        """grid 에서 occupied(1) 셀들의 최소 바운딩 박스만 남기고 잘라낸다.
+
+        margin 적용으로 가장자리 행/열이 전부 비어 있게 되는 경우,
+        결과 모양(Shape)이 실제 블록 모양과 정확히 일치하도록 한다.
+        """
+        if grid.sum() == 0:
+            return grid
+        rows = np.any(grid, axis=1)
+        cols = np.any(grid, axis=0)
+        r0, r1 = np.where(rows)[0][[0, -1]]
+        c0, c1 = np.where(cols)[0][[0, -1]]
+        return grid[r0 : r1 + 1, c0 : c1 + 1]
 
     # ------------------------------------------------------------------
     def detect(self, frame: np.ndarray) -> List[DetectedPiece]:
@@ -189,6 +226,7 @@ class BlockDetector:
 
     # ------------------------------------------------------------------
     def draw_debug_overlay(self, frame: np.ndarray, detections: List[DetectedPiece]) -> np.ndarray:
+        """슬롯 사각형 + 인식된 블록의 셀 단위 Grid(■=채움, □=빈칸)를 그린다."""
         out = frame.copy()
         for slot_rect, det in zip(self.config.tray.slot_rects, detections):
             x, y, w, h = slot_rect
@@ -196,7 +234,30 @@ class BlockDetector:
                 continue
             color = (0, 255, 0) if not det.empty else (0, 0, 255)
             cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
-            if not det.empty:
-                bx, by, bw, bh = det.bbox
-                cv2.rectangle(out, (x + bx, y + by), (x + bx + bw, y + by + bh), (255, 0, 255), 1)
+            if det.empty:
+                continue
+
+            bx, by, bw, bh = det.bbox
+            ox, oy = x + bx, y + by
+            cv2.rectangle(out, (ox, oy), (ox + bw, oy + bh), (255, 0, 255), 1)
+
+            grid_rows, grid_cols = det.grid.shape
+            if grid_rows == 0 or grid_cols == 0 or bw <= 0 or bh <= 0:
+                continue
+
+            sub_w = bw / grid_cols
+            sub_h = bh / grid_rows
+            for r in range(grid_rows):
+                for c in range(grid_cols):
+                    cx0 = int(ox + c * sub_w)
+                    cy0 = int(oy + r * sub_h)
+                    cx1 = int(ox + (c + 1) * sub_w)
+                    cy1 = int(oy + (r + 1) * sub_h)
+                    if det.grid[r, c]:
+                        cell_overlay = out.copy()
+                        cv2.rectangle(cell_overlay, (cx0, cy0), (cx1, cy1), (0, 255, 255), -1)
+                        cv2.addWeighted(cell_overlay, 0.4, out, 0.6, 0, out)
+                        cv2.rectangle(out, (cx0, cy0), (cx1, cy1), (0, 255, 255), 1)
+                    else:
+                        cv2.rectangle(out, (cx0, cy0), (cx1, cy1), (120, 120, 120), 1)
         return out
