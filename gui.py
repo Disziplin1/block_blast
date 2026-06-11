@@ -18,7 +18,7 @@ import hashlib
 import sys
 import time
 from collections import Counter, deque
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -198,6 +198,10 @@ class PipelineWorker(QtCore.QThread):
         self._board_hash_history: deque = deque(maxlen=30)
         self._blocks_hash_history: deque = deque(maxlen=30)
 
+        # 직전 프레임의 보드 인식 결과 (Board Hash 흔들림 원인 분석용)
+        self._prev_frame_board: Optional[np.ndarray] = None
+        self._prev_frame_board_debug: Optional[List[Tuple[int, int, float, float, bool]]] = None
+
         # 블록별 Shape 안정성 추적: 최근 10프레임 Majority Vote + 5프레임 이상
         # 동일 Majority 가 유지되면 Stable Shape 로 확정한다. Solver 에는
         # Stable Shape(없으면 현재 Majority Shape)만 전달한다.
@@ -243,7 +247,25 @@ class PipelineWorker(QtCore.QThread):
                     continue
 
                 with timer.stage("Detect"):
-                    board = self.board_detector.detect(frame)
+                    board, board_debug = self.board_detector.detect_with_debug(frame)
+
+                # Board Hash 가 프레임마다 흔들리는 원인을 찾기 위해, 직전 프레임과
+                # occupied 판정이 달라진 셀의 saturation/margin 을 비교 로깅한다.
+                if self._debug_mode and self._prev_frame_board is not None:
+                    if not np.array_equal(board, self._prev_frame_board):
+                        diffs = []
+                        for (r, c, sat, margin, occ), (pr, pc, psat, pmargin, pocc) in zip(
+                            board_debug, self._prev_frame_board_debug or []
+                        ):
+                            if occ != pocc:
+                                diffs.append(
+                                    f"  Cell({r},{c}): prev sat={psat:.1f} margin={pmargin:+.1f} occ={pocc} "
+                                    f"-> now sat={sat:.1f} margin={margin:+.1f} occ={occ}"
+                                )
+                        if diffs:
+                            logger.info("Board changed cells:\n%s", "\n".join(diffs))
+                self._prev_frame_board = board.copy()
+                self._prev_frame_board_debug = board_debug
 
                 with timer.stage("Recognize"):
                     detections = self.block_detector.detect(frame)

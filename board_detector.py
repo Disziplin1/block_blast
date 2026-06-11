@@ -189,12 +189,26 @@ class BoardDetector:
         -------
         np.ndarray, shape=(8,8), dtype=int8, 값 0(빈칸)/1(블록)
         """
+        grid, _ = self.detect_with_debug(frame)
+        return grid
+
+    # ------------------------------------------------------------------
+    def detect_with_debug(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Tuple[int, int, float, float, bool]]]:
+        """detect() 와 동일하지만, 각 셀의 (r, c, saturation, margin, occupied) 디버그
+        정보도 함께 반환한다.
+
+        margin = saturation - 판정 임계값. 0 에 가까울수록(절대값이 작을수록)
+        occupied/empty 판정이 프레임 노이즈에 의해 뒤집히기 쉬운 경계 셀이다.
+        프레임마다 Board Hash 가 흔들릴 때, 이 margin 값을 비교하면 어떤 셀이
+        원인인지 찾을 수 있다.
+        """
         board_rect = self.config.board.board_rect
         if board_rect == (0, 0, 0, 0):
             logger.warning("detect(): board_rect not calibrated yet")
-            return np.zeros((ROWS, COLS), dtype=np.int8)
+            return np.zeros((ROWS, COLS), dtype=np.int8), []
 
         grid = np.zeros((ROWS, COLS), dtype=np.int8)
+        debug_cells: List[Tuple[int, int, float, float, bool]] = []
         baseline_even, baseline_odd = self.config.board.empty_saturation_baseline
         threshold = self.config.board.empty_saturation_threshold
 
@@ -203,13 +217,15 @@ class BoardDetector:
 
             if self.config.board.calibrated:
                 baseline = baseline_even if (r + c) % 2 == 0 else baseline_odd
-                is_filled = sat > baseline + threshold
+                cutoff = baseline + threshold
             else:
-                is_filled = sat > threshold
+                cutoff = threshold
 
+            is_filled = sat > cutoff
             grid[r, c] = 1 if is_filled else 0
+            debug_cells.append((r, c, sat, sat - cutoff, is_filled))
 
-        return grid
+        return grid, debug_cells
 
     # ------------------------------------------------------------------
     def draw_debug_overlay(self, frame: np.ndarray, grid: np.ndarray) -> np.ndarray:
