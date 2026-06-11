@@ -56,6 +56,13 @@ def _stability_pct(history: "deque") -> float:
     return (same / (len(history) - 1)) * 100.0
 
 
+def _format_cell_debug(det: DetectedPiece) -> str:
+    """블록 1개의 셀별 평균 RGB / Occupied 판정 결과를 콘솔 출력용 문자열로 변환한다."""
+    if det.empty or not det.debug_cells:
+        return "  (empty)"
+    return "\n".join(f"  Cell({r},{c})=RGB{rgb}={occ}" for r, c, rgb, occ in det.debug_cells)
+
+
 # ---------------------------------------------------------------------------
 # 화면 영역 드래그 선택용 투명 위젯
 # ---------------------------------------------------------------------------
@@ -133,6 +140,9 @@ class PipelineResult:
         search_executed: bool = True,
         board_stable_pct: float = 100.0,
         blocks_stable_pct: float = 100.0,
+        roi_images: Optional[List[np.ndarray]] = None,
+        block_stable: Optional[List[bool]] = None,
+        block_confidence: Optional[List[float]] = None,
     ):
         self.frame = frame
         self.board = board
@@ -146,6 +156,9 @@ class PipelineResult:
         self.search_executed = search_executed
         self.board_stable_pct = board_stable_pct
         self.blocks_stable_pct = blocks_stable_pct
+        self.roi_images = roi_images or []
+        self.block_stable = block_stable or []
+        self.block_confidence = block_confidence or []
 
 
 class PipelineWorker(QtCore.QThread):
@@ -180,6 +193,17 @@ class PipelineWorker(QtCore.QThread):
         self._prev_solve_result: Optional[SolveResult] = None
         self._board_hash_history: deque = deque(maxlen=30)
         self._blocks_hash_history: deque = deque(maxlen=30)
+
+        # 블록별 Shape 안정성 추적 (#5)
+        slot_count = self.config.tray.slot_count
+        self._block_hash_history: List[deque] = [deque(maxlen=30) for _ in range(slot_count)]
+        self._block_prev_hash: List[Optional[str]] = [None] * slot_count
+        self._block_consecutive: List[int] = [0] * slot_count
+
+        self._debug_mode = False
+
+    def set_debug_mode(self, enabled: bool) -> None:
+        self._debug_mode = enabled
 
     def start_pipeline(self) -> None:
         self._running = True
@@ -226,6 +250,23 @@ class PipelineWorker(QtCore.QThread):
                 board_stable_pct = _stability_pct(self._board_hash_history)
                 blocks_stable_pct = _stability_pct(self._blocks_hash_history)
 
+                # 블록별 Shape 안정성: 5프레임 이상 동일하면 Stable, Confidence 는
+                # 최근 30프레임 중 현재 Shape 와 같은 비율 (#5)
+                block_stable: List[bool] = []
+                block_confidence: List[float] = []
+                for i, det in enumerate(detections):
+                    block_hash = hashlib.md5(str(det.grid.tolist()).encode("utf-8")).hexdigest()[:8]
+                    hist = self._block_hash_history[i]
+                    hist.append(block_hash)
+                    if self._block_prev_hash[i] == block_hash:
+                        self._block_consecutive[i] += 1
+                    else:
+                        self._block_consecutive[i] = 1
+                    self._block_prev_hash[i] = block_hash
+                    block_stable.append(self._block_consecutive[i] >= 5)
+                    same = sum(1 for h in hist if h == block_hash)
+                    block_confidence.append(same / len(hist) * 100.0)
+
                 # 화면이 이전 프레임과 동일하면 Solver 를 다시 실행하지 않는다 (#2)
                 board_unchanged = (
                     self._prev_board is not None and np.array_equal(board, self._prev_board)
@@ -267,6 +308,18 @@ class PipelineWorker(QtCore.QThread):
                     blocks_stable_pct,
                 )
 
+                roi_images: List[np.ndarray] = []
+                if self._debug_mode:
+                    for i, det in enumerate(detections, start=1):
+                        logger.info(
+                            "Block%d Cells (threshold=%.1f, stable=%s, confidence=%.0f%%):\n%s",
+                            i, det.threshold_used,
+                            block_stable[i - 1] if i - 1 < len(block_stable) else False,
+                            block_confidence[i - 1] if i - 1 < len(block_confidence) else 0.0,
+                            _format_cell_debug(det),
+                        )
+                        roi_images.append(self.block_detector.render_roi_debug(frame, self.config.tray.slot_rects[i - 1], det))
+
                 result = PipelineResult(
                     frame=frame,
                     board=board,
@@ -280,6 +333,9 @@ class PipelineWorker(QtCore.QThread):
                     search_executed=search_executed,
                     board_stable_pct=board_stable_pct,
                     blocks_stable_pct=blocks_stable_pct,
+                    roi_images=roi_images,
+                    block_stable=block_stable,
+                    block_confidence=block_confidence,
                 )
                 self.result_ready.emit(result)
 
@@ -503,6 +559,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.rec_labels.append(labels)
             right_layout.addWidget(group)
 
+        # Debug 모드: 블록별 ROI 미리보기 (Cell Grid + Shape Matrix) (#1, #2, #6)
+        roi_group = QtWidgets.QGroupBox("Block ROI (Debug)")
+        roi_layout = QtWidgets.QHBoxLayout(roi_group)
+        self.roi_labels: List[QtWidgets.QLabel] = []
+        self.roi_info_labels: List[QtWidgets.QLabel] = []
+        for i in range(self.config.tray.slot_count):
+            col = QtWidgets.QVBoxLayout()
+            title = QtWidgets.QLabel(f"Block{i + 1} ROI")
+            col.addWidget(title)
+            img_label = QtWidgets.QLabel("-")
+            img_label.setFixedSize(120, 120)
+            img_label.setAlignment(QtCore.Qt.AlignCenter)
+            img_label.setStyleSheet("background-color: #222; color: #888;")
+            col.addWidget(img_label)
+            info_label = QtWidgets.QLabel("-")
+            info_label.setWordWrap(True)
+            col.addWidget(info_label)
+            self.roi_labels.append(img_label)
+            self.roi_info_labels.append(info_label)
+            roi_layout.addLayout(col)
+        right_layout.addWidget(roi_group)
+
         # Debug 모드: 휴리스틱 항목별 점수 + MCTS 트리 통계
         debug_group = QtWidgets.QGroupBox("Debug Info")
         debug_layout = QtWidgets.QVBoxLayout(debug_group)
@@ -562,6 +640,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_debug_toggled(self, checked: bool) -> None:
         self._debug_mode = checked
+        self.worker.set_debug_mode(checked)
+        if not checked:
+            for label in self.roi_labels:
+                label.clear()
+            for label in self.roi_info_labels:
+                label.setText("-")
 
     def on_highlight_changed(self, index: int) -> None:
         rank = self.combo_highlight.itemData(index)
@@ -621,6 +705,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._debug_mode:
             self._update_preview(result)
             self._update_debug_panel(result)
+            self._update_block_rois(result)
         else:
             self.debug_view.setPlainText("")
 
@@ -684,11 +769,15 @@ class MainWindow(QtWidgets.QMainWindow):
         sr = result.solve_result
         lines: List[str] = []
 
-        # Vision 안정성 정보 (#3, #7)
+        # Vision 안정성 정보 (#3, #5, #7)
         lines.append("=== Vision Stability ===")
         lines.append(f"Board Hash: {result.board_hash}")
         for i, shape in enumerate(result.block_shapes, start=1):
             lines.append(f"Block{i}: {shape}")
+            if i - 1 < len(result.block_stable):
+                stable = "Stable" if result.block_stable[i - 1] else "Unstable"
+                conf = result.block_confidence[i - 1]
+                lines.append(f"  -> {stable} (Confidence: {conf:.0f}%)")
         lines.append(f"Search Executed: {'YES' if result.search_executed else 'NO'}")
         lines.append(f"Board Stable: {result.board_stable_pct:.0f}%")
         lines.append(f"Blocks Stable: {result.blocks_stable_pct:.0f}%")
@@ -733,6 +822,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self.preview_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
         )
         self.preview_label.setPixmap(scaled)
+
+    def _update_block_rois(self, result: PipelineResult) -> None:
+        """Block1/2/3 ROI(셀 그리드 + Shape Matrix)를 별도 미리보기로 표시한다 (#1, #2, #6)."""
+        for i, img_label in enumerate(self.roi_labels):
+            if i >= len(result.roi_images):
+                img_label.clear()
+                self.roi_info_labels[i].setText("-")
+                continue
+
+            roi = result.roi_images[i]
+            rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
+            pix = QtGui.QPixmap.fromImage(qimg)
+            img_label.setPixmap(pix.scaled(
+                img_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+            ))
+
+            shape = result.block_shapes[i] if i < len(result.block_shapes) else "(empty)"
+            stable = result.block_stable[i] if i < len(result.block_stable) else False
+            conf = result.block_confidence[i] if i < len(result.block_confidence) else 0.0
+            det = result.detections[i] if i < len(result.detections) else None
+            threshold = det.threshold_used if det is not None else 0.0
+            self.roi_info_labels[i].setText(
+                f"Shape: {shape}\n"
+                f"{'Stable' if stable else 'Unstable'} (Conf: {conf:.0f}%)\n"
+                f"Threshold: {threshold:.1f}"
+            )
 
     # ------------------------------------------------------------------
     def _log(self, message: str) -> None:
